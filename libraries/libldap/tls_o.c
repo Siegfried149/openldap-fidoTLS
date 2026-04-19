@@ -48,6 +48,9 @@
 #include <openssl/dh.h>
 #endif
 
+#include <fidossl.h>
+#include <openssl/ui.h>
+
 #if OPENSSL_VERSION_NUMBER >= 0x10100000
 #define ASN1_STRING_data(x)	ASN1_STRING_get0_data(x)
 #endif
@@ -368,6 +371,7 @@ tlso_ctx_cipher13( tlso_ctx *ctx, char *suites, char **oldsuites )
 }
 #endif /* OpenSSL 1.1.1 */
 
+
 /*
  * initialize a new TLS context
  */
@@ -640,6 +644,83 @@ tlso_ctx_init( struct ldapoptions *lo, struct ldaptls *lt, int is_server, char *
 		SSL_CTX_set_info_callback( ctx, tlso_info_cb );
 	}
 
+
+
+
+	// here fidoSSL is used:
+	if (is_server) {
+		char *id = NULL;
+
+		X509 *cert = SSL_CTX_get0_certificate(ctx);
+		if (cert == NULL)
+			Debug0(LDAP_DEBUG_ANY, "fidoTLS: no certificate loaded!\n");
+		GENERAL_NAMES *san_names = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+
+		if (san_names != NULL) {
+			int count = sk_GENERAL_NAME_num(san_names);
+			// there might be multiple SAN names, choose the first one
+			for (int i = 0; i < count; i++) {
+				const GENERAL_NAME *current_name = sk_GENERAL_NAME_value(san_names, i);
+				if (current_name->type == GEN_DNS) {
+					const char *dns_name = ASN1_STRING_get0_data(current_name->d.dNSName);
+					id = strdup(dns_name);
+					break;
+				}
+			}
+
+			sk_GENERAL_NAME_pop_free(san_names, GENERAL_NAME_free);
+		}
+		if (id == NULL) {
+			Debug0(LDAP_DEBUG_ANY,
+			       "fidoTLS: no certificate with DNS SAN name, please update the certificate\n"); 
+		}
+
+		FIDOSSL_SERVER_OPTS *opts = malloc(sizeof(FIDOSSL_SERVER_OPTS));
+		if (opts == NULL) {
+			Debug0( LDAP_DEBUG_ANY, "fidoTLS: malloc failed\n");
+			return -1;
+		}
+		opts->rp_id = id;
+		opts->rp_name = id;
+		opts->ticket_b64 = NULL;
+		opts->user_verification = REQUIRED;
+		opts->resident_key = REQUIRED;
+		opts->auth_attach = CROSS_PLATFORM;
+		opts->transport = USB;
+		opts->timeout = 60000; // 1 Minute
+		opts->debug_level = DEBUG_LEVEL_MORE_VERBOSE;
+
+		SSL_CTX_add_custom_ext(ctx, FIDOSSL_EXT_TYPE, FIDOSSL_CONTEXT, fidossl_server_add_cb, NULL, NULL,
+							   fidossl_server_parse_cb, opts);
+	} else { // client
+		char *pin = malloc(128); // a local variable is not enough because the pin is used past the function
+		if (pin == NULL) {
+			Debug0( LDAP_DEBUG_ANY, "fidoTLS: malloc failed\n");
+			return -1;
+		}
+		int status = UI_UTIL_read_pw_string(pin, sizeof(pin), "Enter FIDO PIN: ", 0);
+		if (status != 0) {
+			Debug0( LDAP_DEBUG_ANY, "fidoTLS: error reading PIN\n");
+			return -1;
+		}
+
+		FIDOSSL_CLIENT_OPTS *opts = malloc(sizeof(FIDOSSL_CLIENT_OPTS));
+		if (opts == NULL) {
+			Debug0( LDAP_DEBUG_ANY, "fidoTLS: malloc failed\n");
+			return -1;
+		}
+		opts->mode = FIDOSSL_AUTHENTICATE; // registry handled elsewhere
+		opts->user_name = NULL;
+		opts->user_display_name = NULL;
+		opts->ticket_b64 = NULL;
+		opts->pin = pin; // TODO UI_UTIL_read_pw_string
+		opts->debug_level = DEBUG_LEVEL_MORE_VERBOSE;
+
+		fidossl_init_client_ctx(ctx);
+		SSL_CTX_add_custom_ext(ctx, FIDOSSL_EXT_TYPE, FIDOSSL_CONTEXT, fidossl_client_add_cb, NULL, opts,
+							   fidossl_client_parse_cb, NULL);
+	}
+
 	i = SSL_VERIFY_NONE;
 	if ( lo->ldo_tls_require_cert ) {
 		i = SSL_VERIFY_PEER;
@@ -649,9 +730,14 @@ tlso_ctx_init( struct ldapoptions *lo, struct ldaptls *lt, int is_server, char *
 		}
 	}
 
-	SSL_CTX_set_verify( ctx, i,
-		lo->ldo_tls_require_cert == LDAP_OPT_X_TLS_ALLOW ?
-		tlso_verify_ok : tlso_verify_cb );
+	if (!is_server)
+		SSL_CTX_set_verify( ctx, i,
+				    lo->ldo_tls_require_cert == LDAP_OPT_X_TLS_ALLOW ?
+				    tlso_verify_ok : tlso_verify_cb );
+	else // necessary for the FIDO extension to operate correctly
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, no_verify_cb);
+
+
 #if OPENSSL_VERSION_NUMBER < 0x10100000
 	SSL_CTX_set_tmp_rsa_callback( ctx, tlso_tmp_rsa_cb );
 #endif
